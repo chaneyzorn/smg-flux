@@ -23,7 +23,16 @@
                             ▼
                    ┌─────────────────┐
                    │  Higress Gateway │
-                   │  (外层轮询/weight)│
+                   │  (外层 weight/   │
+                   │   轮询到 Group)  │
+                   └────────┬────────┘
+                            │
+                   ┌────────▼────────┐
+                   │  wasm-go Plugin  │
+                   │  (按 Group 选择  │
+                   │   healthy ep,    │
+                   │   SetUpstream    │
+                   │   OverrideHost)  │
                    └────────┬────────┘
                             │
           ┌─────────────────┼─────────────────┐
@@ -46,19 +55,12 @@
    │ │  standby│ │   │ │  standby│ │   │ │  standby│ │
    │ └─────────┘ │   │ └─────────┘ │   │ └─────────┘ │
    └─────────────┘   └─────────────┘   └─────────────┘
-          │                 │                 │
-          └─────────────────┴─────────────────┘
-                            │
-                   ┌────────▼────────┐
-                   │  wasm-go Plugin  │
-                   │  (SetUpstreamOverrideHost)
-                   └─────────────────┘
 ```
 
-- 外层 Higress 通过 VirtualService weight/轮询将请求分发到各 Group（Envoy cluster）
-- 每个 Group 内部有 N 个 endpoint（SMG 实例），完全平等，无主备角色之分
-- 插件在 Group 内部选择一个 healthy endpoint 并**稳定锁定**（`SetUpstreamOverrideHost`）
+- 外层 Higress 通过 VirtualService weight/轮询将请求路由到某个 Group（Envoy cluster）
+- **在请求到达具体 endpoint 之前**，wasm-go Plugin 拦截请求，读取当前 Group 的 endpoint 列表，选择 healthy endpoint 并**稳定锁定**（`SetUpstreamOverrideHost`）
 - 所有请求集中到锁定的 endpoint，避免轮询导致的 cache tree 分散
+- 每个 Group 内部的 endpoint 完全平等，不存在固定的"主"和"备"
 
 **结论**：拓扑信息来自三个来源：
 1. **WasmPlugin CRD 的 `defaultConfig`** — 静态声明每个 Group 的 endpoint 列表和探测参数
