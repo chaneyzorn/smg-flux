@@ -4,8 +4,8 @@
 
 涉及的开源组件：
 
-- <https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway>
 - <https://github.com/higress-group/higress>
+- <https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway>
 
 > **注意**：调研方案由 Kimi2.6 协助撰写，其中存在未经实证的细节，请读者仔细斟查。
 
@@ -213,6 +213,8 @@ V6 调研了几种同步拓扑：KV Event Stream 中心总线、Router 间操作
 
 这个方向如果走通，SMG 的 Router 层可以做到对等扩展，主备切换逻辑不再是必需。它和 V5 的 WASM failover 不在同一层面：V5 处理 worker 节点瞬时故障时的请求保底，V6 处理 Router 层多实例扩展时的 cache 一致性。
 
+主备结构下，一个 Group 内只有一个活跃 Router 维护 cache tree，其余备节点不持有完整树。如果改为对等扩展加同步，每个 Router 实例都需要维护一份完整的 cache tree 数据，内存需求随副本数线性增加。而且无论选择哪种同步拓扑，都需要引入一个高可用的日志发布订阅组件来承载 tree 操作事件流，这本身就是一个需要独立设计和运维的系统。
+
 → [V6 调研方案](ha_design_v6/active_standby_ha_design_v6_research.draft.md)
 
 ---
@@ -223,7 +225,7 @@ V6 调研了几种同步拓扑：KV Event Stream 中心总线、Router 间操作
 
 V5.1 本身还有待验证：implementation_design.md 中的代码逻辑能否在实际环境中跑通，SharedData 在并发写入时是否正确处理，SSE 流式场景的重试边界是否覆盖完整，这些都需要在后续的开发或实验中逐步验证。
 
-V6 是另一个方向。如果 cache tree 同步能走通，主备结构就不再需要，Router 层可以做到对等扩展。但 V6 的事件同步路径在 sglang 源码中已有骨架，接收端的触发机制尚未打通，需要的工作量比 V5.1 大得多。在 V6 成熟之前，V5.1 仍然有必要——即使 cache tree 分散问题最终被同步解决，worker 节点的瞬时故障仍然需要请求保底机制。
+V6 是另一个方向。如果 cache tree 同步能走通，主备结构就不再需要，Router 层可以做到对等扩展。在 V6 成熟之前，V5.1 仍然有必要——即使 cache tree 分散问题最终被同步解决，worker 节点的瞬时故障仍然需要请求保底机制。
 
 ---
 
