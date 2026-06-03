@@ -1,0 +1,22 @@
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: kimi-router-ha-se
+  namespace: higress-system
+  labels:
+    app: kimi-router
+    model: k2.5
+    tier: router
+spec:
+  endpoints:
+    - address: kimi-k25-router-5p3d-0.default.svc.cluster.local
+    - address: kimi-k25-router-5p3d-1.default.svc.cluster.local
+    - address: kimi-k25-router-5p3d-2.default.svc.cluster.local
+  hosts:
+    - kimi-router-ha-cluster.local
+  location: MESH_INTERNAL
+  ports:
+    - name: http
+      number: 30002
+      protocol: HTTP
+  resolution: DNS

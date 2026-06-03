@@ -1,0 +1,19 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: kimi-router-vs
+  namespace: higress-system
+spec:
+  hosts:
+    - "api.kimi-router.example.com"
+  gateways:
+    - kimi-router-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: kimi-router-ha-cluster.local
+            port:
+              number: 30002
