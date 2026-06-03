@@ -2,6 +2,11 @@
 
 这里记录了我们（我和 Kimi2.6）在给 sgl-model-gateway（SMG）做高可用设计时，从 V0 到 V6 逐步探索、不断调整思路的过程。每个目录对应一个阶段的思考，下面简述每个方案提出时的动机，以及方案演进中的权衡和取舍。
 
+涉及的开源组件：
+
+- <https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway>
+- <https://github.com/higress-group/higress>
+
 > **注意**：调研方案由 Kimi2.6 协助撰写，其中存在未经实证的细节，请读者仔细斟查。
 
 ---
@@ -216,7 +221,7 @@ V6 调研了几种同步拓扑：KV Event Stream 中心总线、Router 间操作
 
 目前倾向的方案是 V5.1：用 Higress wasm-go 插件实现基于健康检查的 endpoint 稳定锁定，同时支持 preemptive 切换和被动重试，不引入额外组件。这个方向的可行性建立在 `ai-proxy` 和 `ai-load-balancer` 两个已生产验证的插件之上。
 
-V5.1 本身还有待验证：implementation_design.md 中的代码逻辑能否在实际环境中跑通，SharedData 的并发模型是否足够健壮，SSE 流式场景的重试边界是否覆盖完整，这些都需要在后续的开发或实验中逐步验证。
+V5.1 本身还有待验证：implementation_design.md 中的代码逻辑能否在实际环境中跑通，SharedData 在并发写入时是否正确处理，SSE 流式场景的重试边界是否覆盖完整，这些都需要在后续的开发或实验中逐步验证。
 
 V6 是另一个方向。如果 cache tree 同步能走通，主备结构就不再需要，Router 层可以做到对等扩展。但 V6 的事件同步路径在 sglang 源码中已有骨架，接收端的触发机制尚未打通，需要的工作量比 V5.1 大得多。在 V6 成熟之前，V5.1 仍然有必要——即使 cache tree 分散问题最终被同步解决，worker 节点的瞬时故障仍然需要请求保底机制。
 
