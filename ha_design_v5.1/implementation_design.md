@@ -1624,3 +1624,4 @@ POST /v1/completions       → OpenAI 兼容格式
 | SSE 流式中断无法重试 | 客户端收到截断响应 | 客户端实现重连 + token 续传逻辑 |
 | WASM VM 重建 | 本地缓存丢失 | 缓存丢失后自动回源 SharedData，无状态设计 |
 | 插件 panic | 请求处理中断 | wasm-go 框架捕获 panic，FAIL_OPEN 策略继续处理 |
+| Circuit breaker 触发后的插件行为 | 插件难以区分 503 是 upstream 故障还是连接池超限，重试逻辑可能无效 | 当前设计未处理该场景，待验证：Envoy 生成 local 503 的 response flag 是否可被插件读取，以及 circuit breaker 触发时即时健康检查的行为是否符合预期 |
