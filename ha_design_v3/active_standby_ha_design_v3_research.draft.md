@@ -197,9 +197,126 @@ backend smg_group_1
 
 ---
 
-## 四、方案 C：独立 Higress 作为子网关
+## 四、方案 B+：OpenResty / Kong 作为子网关
 
-### 4.1 架构
+### 4.1 OpenResty 作为子网关
+
+#### 4.1.1 架构与能力边界
+
+OpenResty（Nginx + LuaJIT）的核心优势在于 `balancer_by_lua_block` 阶段提供了对 upstream 选择的完全编程控制。`ngx.balancer` 模块暴露的 API：
+
+| API | 作用 |
+|-----|------|
+| `balancer.set_current_peer(host, port)` | 设置当前重试的上游 peer |
+| `balancer.set_more_tries(count)` | 设置额外重试次数 |
+| `balancer.get_last_failure()` | 获取上次失败原因（`"failed"`、`"next"`、状态码） |
+
+这意味着在 `balancer_by_lua_block` 中可以基于健康状态和优先级顺序选择 endpoint，天然支持多级 failover：
+
+```lua
+balancer_by_lua_block {
+    local balancer = require "ngx.balancer"
+    local peers = {
+        {host = "smg-group-1-0.headless", port = 30002, priority = 0},  -- 主
+        {host = "smg-group-1-1.headless", port = 30002, priority = 1},  -- 备A
+        {host = "smg-group-1-2.headless", port = 30002, priority = 2},  -- 备B
+    }
+    
+    local state = ngx.ctx.tries or 0
+    local target = peers[state + 1]
+    
+    ngx.ctx.tries = state + 1
+    balancer.set_more_tries(#peers - state - 1)
+    balancer.set_current_peer(target.host, target.port)
+}
+```
+
+#### 4.1.2 健康检查
+
+OpenResty/nginx OSS **不包含原生主动健康检查**。可选方案：
+
+1. **`lua-resty-healthcheck`**（Kong 出品）：通过 `ngx.timer.*` 做后台探测，`lua_shared_dict` 做跨 worker 状态共享，支持 HTTP/HTTPS/TCP 探测和 healthy/unhealthy 阈值。事件通过 `lua-resty-worker-events` 分发。
+2. **`lua-resty-upstream`**（hamishforbes）：**原生支持 priority-based pools**，可定义 `primary`（priority=0）和 `dr`（priority=10）池，高优先级池优先使用，低优先级池作为 failover。
+
+#### 4.1.3 行为分析
+
+| 场景 | OpenResty 行为 | 是否符合需求 |
+|------|---------------|------------|
+| 主健康 | `balancer` 选择 priority=0 的主节点 | ✅ 符合 |
+| 主挂了（第一次重试） | `get_last_failure()` 返回失败，`balancer` 选择 priority=1 的备A | ✅ 符合 |
+| 主 + 备A 挂了（第二次重试） | 再次失败，`balancer` 选择 priority=2 的备B | ✅ 符合 |
+
+**结论**：✅ **OpenResty 完全可行**。`balancer_by_lua_block` + `lua-resty-healthcheck`/`lua-resty-upstream` 可以完整实现多级 preemptive failover 和主动健康检查，没有架构层面的 blocker。
+
+---
+
+### 4.2 Kong 作为子网关
+
+#### 4.2.1 Kong 的插件阶段限制
+
+Kong 的插件架构**不暴露 `balancer` 阶段**给自定义插件。官方支持的插件阶段：
+
+| 阶段 | 自定义插件可 hook | 与 upstream 选择相关 |
+|------|------------------|---------------------|
+| `init_worker` | ✅ | 否 |
+| `rewrite` | ✅ | 路由前 |
+| `access` | ✅ | 转发前 |
+| `header_filter` | ✅ | 响应后 |
+| `body_filter` | ✅ | 响应体后 |
+| `log` | ✅ | 请求完成后 |
+| **`balancer`** | ❌ **未暴露** | **Kong 内部选择 target** |
+
+Kong issue [#6241](https://github.com/Kong/kong/issues/6241) 明确记录了社区请求开放 balancer 阶段的讨论，但截至目前仍未向自定义插件开放。
+
+#### 4.2.2 `access` 阶段的绕过方案
+
+在 `access` 阶段，Kong PDK 提供：
+
+| 函数 | 行为 | 健康检查 | 重试 |
+|------|------|---------|------|
+| `kong.service.set_upstream(name)` | 使用命名的 Upstream 实体做 LB | ✅ Kong 内置 | ✅ Kong 内置 |
+| `kong.service.set_target(host, port)` | **完全绕过 LB**；直接连接 host:port | ❌ **丢失** | ❌ **丢失**（需手动设置） |
+
+**关键限制**：使用 `set_target()` 会**丢失 Kong 内置的主动/被动健康检查**和 ring balancer 的重试逻辑。插件必须在外部维护健康状态（如共享字典或外部缓存），并手动实现重试。
+
+#### 4.2.3 Kong 内置的 priority / failover 能力
+
+Kong v3.12+ 引入了 `failover: true` 的 Target 标志：
+> "A Target should be used as a failover (backup) Target in case the other, regular targets are unhealthy... The failover Target is only used when all regular Targets are unhealthy."
+
+但这只支持**单级备份**（regular → failover），不支持多级（primary → backup-A → backup-B）。
+
+Kong 的 AI Proxy Advanced 插件（v3.10+）确实有 `priority` 算法：
+> "Routes requests to models based on assigned priority groups... falls back to the next group."
+
+但这是**特定于 LLM 路由**的功能，不适用于通用 upstream。
+
+**结论**：⚠️ **Kong 对于通用流量的多级 failover 不实用**。Balancer 阶段不可 hook，`set_target()` 绕过会丢失健康检查，内置 failover 只支持单级。实现完整的多级 failover 需要在 `access` 阶段重建一套健康感知 + 重试系统，复杂度高。
+
+---
+
+### 4.3 引入新组件生态的代价
+
+OpenResty 在技术上完全可行，但代价明显：
+
+| 维度 | 引入 OpenResty/Kong 作为子网关 |
+|------|------------------------------|
+| **技术栈** | 新增 Lua 生态（OpenResty/Kong）与现有 Higress/Envoy/K8s 技术栈并行 |
+| **配置管理** | Nginx conf / Kong declarative config 与 Istio CRD 两套体系 |
+| **监控/日志** | 独立的 metrics 格式、日志格式、告警规则 |
+| **版本升级** | OpenResty/Kong 的升级节奏与 Higress 独立，需要分别测试兼容性 |
+| **高可用** | 子网关本身需要多副本部署、健康检查、故障恢复 |
+| **网络跳数** | 父网关 → 子网关 → SMG，增加一跳延迟 |
+
+**核心问题**：如果用插件实现 failover，为什么不直接用 Higress 自身的插件能力？Higress 的 wasm-go 框架同样支持自定义路由逻辑（`SetUpstreamOverrideHost`、`RegisterTickFunc` 等，详见 V5.1 调研）。引入 OpenResty/Kong 只是换了一个地方写插件，没有解决本质问题，反而增加了组件多样性。
+
+**结论**：⚠️ **OpenResty 可行但不推荐，Kong 不推荐**。OpenResty 的 `balancer_by_lua` 能力足够，但引入新的网关组件生态的代价高于收益。如果团队已经在使用 OpenResty/Kong，可以考虑；否则不如回归 Higress 自身的插件能力（V5.1 方向）。
+
+---
+
+## 五、方案 C：独立 Higress 作为子网关
+
+### 5.1 架构
 
 每个 group 部署一个独立的 Higress Gateway 实例作为子网关，子网关内部使用 EnvoyFilter 配置 Aggregate Cluster。
 
@@ -215,7 +332,7 @@ Aggregate   Aggregate   Aggregate
 Cluster     Cluster     Cluster
 ```
 
-### 4.2 分析
+### 5.2 分析
 
 **优势**：
 - 父网关配置极简（标准 VirtualService + weight）
@@ -241,7 +358,7 @@ Cluster     Cluster     Cluster
 
 不引入新的代理组件，利用 Higress 自身的插件能力实现子网关的主备逻辑。
 
-### 5.2 核心发现
+### 6.2 核心发现
 
 经过对 proxy-wasm ABI、Higress ai-proxy 源码（failover.go、retry.go）以及社区 issue 的深入分析：
 
@@ -258,7 +375,7 @@ Cluster     Cluster     Cluster
    - `RegisterTickFunc` 是 Higress 扩展，非标准 proxy-wasm
    - 只能探测，无法在请求到达时 preemptive 切换 cluster
 
-### 5.3 结论
+### 6.3 结论
 
 **WASM/Go 插件无法单独实现 SMG 主备 preemptive failover。**
 
@@ -267,9 +384,9 @@ Cluster     Cluster     Cluster
 
 ---
 
-## 六、方案 E：复用 Higress 作为子网关（McpBridge + 健康检查 Sidecar）
+## 七、方案 E：复用 Higress 作为子网关（McpBridge + 健康检查 Sidecar）
 
-### 6.1 思路
+### 7.1 思路
 
 不引入新的代理组件，而是引入一个**轻量的健康检查 sidecar**，与 Higress 的 McpBridge 配合：
 
@@ -308,7 +425,7 @@ Cluster     Cluster     Cluster
         └──────────┘   └──────────┘   └──────────┘
 ```
 
-### 6.2 核心机制
+### 7.2 核心机制
 
 1. **健康检查 Sidecar**：持续 HTTP 探测 SMG 实例的 `/health`
 2. **注册中心**（Nacos/Consul/etcd）：存储端点列表和权重
@@ -318,7 +435,7 @@ Cluster     Cluster     Cluster
 - Sidecar 更新 Nacos：主的权重设为 0，备A 的权重设为 100
 - Higress McpBridge 感知变化，流量切换到备A
 
-### 6.3 分析
+### 7.3 分析
 
 **优势**：
 - 父网关使用标准 Higress McpBridge，无需 EnvoyFilter
@@ -335,9 +452,9 @@ Cluster     Cluster     Cluster
 
 ---
 
-## 七、方案 F：复用 Higress 作为子网关（AI Gateway 路由能力）
+## 八、方案 F：复用 Higress 作为子网关（AI Gateway 路由能力）
 
-### 7.1 思路
+### 8.1 思路
 
 Higress 的 AI Gateway 支持"多模型 failover"，如：
 - 先尝试 GPT-4，失败则 fallback 到 Claude
@@ -363,7 +480,7 @@ aiRoute:
       fallback: true
 ```
 
-### 7.2 分析
+### 8.2 分析
 
 **问题**：
 1. Higress **开源版**的 AI Gateway **不支持**这种多后端 failover 配置
@@ -381,6 +498,8 @@ aiRoute:
 |------|-----------|-------------------|--------------|---------|---------|-----------|
 | **A. Nginx 子网关** | Nginx (开源) | ✅ | ❌（多备同时接管） | ~2-4s | 3 Nginx Pod | 高 |
 | **B. HAProxy 子网关** | HAProxy | ✅ | ⚠️（需 ACL） | ~2-4s | 3 HAProxy Pod | 中 |
+| **B+. OpenResty 子网关** | OpenResty | ✅ | ✅ | ~2-4s | 3 OpenResty Pod | 高 |
+| **B+. Kong 子网关** | Kong | ✅ | ⚠️（需绕过 balancer） | ~2-4s | 3 Kong Pod | 低 |
 | **C. 独立 Higress 子网关** | Higress | ❌ | ✅ | ~2-4s | 3 Higress 实例 | 低 |
 | **D. WASM/Go 插件** | Higress 自身 | ❌ | ❌（无法 preemptive） | - | 无 | 低（不可行） | 详见 V5 |
 | **E. McpBridge + Sidecar** | Higress + Nacos | ✅ | ⚠️（需验证） | ~3-5s | 3 Sidecar + Nacos | 中 |
@@ -395,13 +514,15 @@ aiRoute:
 经过对 6 个子方案的深入调研，我们发现：
 
 1. **Nginx/HAProxy 开源版**不支持"多级依次 failover"（主 → 备A → 备B），它们的 `backup` 参数在主挂了之后会**同时启用所有备**
-2. **复用 Higress 自身能力**（WASM/Go 插件、AI Gateway）经 V5 深入验证，WASM 无法修改 Router 的 upstream 选择，开源版能力有限
-3. **独立 Higress 子网关**仍然需要 EnvoyFilter，没有解决根本问题
-4. **McpBridge + Sidecar** 可行，但引入了注册中心依赖，复杂度不低于 V4 Operator
+2. **OpenResty**通过 `balancer_by_lua_block` + `lua-resty-healthcheck` 可以完整实现多级 failover，技术可行，但会**引入新的网关组件生态**（Lua 技术栈、独立运维）
+3. **Kong**的 balancer 阶段不向自定义插件开放，内置 failover 只支持单级备份，通用多级 failover **不实用**
+4. **复用 Higress 自身能力**（WASM/Go 插件、AI Gateway）经 V5 深入验证，WASM 无法修改 Router 的 upstream 选择，开源版能力有限
+5. **独立 Higress 子网关**仍然需要 EnvoyFilter，没有解决根本问题
+6. **McpBridge + Sidecar** 可行，但引入了注册中心依赖，复杂度不低于 V4 Operator
 
 ### 9.2 为什么父子网关方向难以实现
 
-根本原因是：**现有的主流 L7 代理（Nginx、HAProxy、Envoy 开源配置）中，只有 Envoy 的 Aggregate Cluster 原生支持按优先级依次 failover，但这个能力在 Istio/Higress 中没有高层 CRD 暴露。**
+根本原因是：**现有的主流 L7 代理（Nginx、HAProxy、Envoy 开源配置）中，只有 Envoy 的 Aggregate Cluster 和 OpenResty 的 `balancer_by_lua` 原生支持按优先级依次 failover。Envoy 的能力在 Istio/Higress 中没有高层 CRD 暴露；OpenResty 的能力需要引入 Lua 技术栈和独立运维，代价不低。**
 
 如果要避免 EnvoyFilter，就需要：
 - 引入新的代理组件（Nginx/HAProxy）→ 但它们开源版不支持
@@ -423,8 +544,10 @@ V3 的调研虽然没有找到完美的"父子网关"方案，但验证了以下
 
 ```
 V3 调研结论：
-  ├── 引入独立 L7 代理（Nginx/HAProxy）
-  │     └── 开源版不支持多级 failover ❌
+  ├── 引入独立 L7 代理（Nginx/HAProxy/OpenResty/Kong）
+  │     ├── Nginx/HAProxy 开源版不支持多级 failover ❌
+  │     ├── OpenResty 可行但引入新组件生态 ⚠️
+  │     └── Kong 通用多级 failover 不实用 ❌
   │
   ├── 复用 Higress 自身能力（插件/AI Gateway）
   │     └── 开源版能力有限 ❌
@@ -503,6 +626,27 @@ curl http://localhost:8080/
 
 - HAProxy Configuration Manual — `backup` 与 `use-server` 说明  
   https://docs.haproxy.org/2.8/configuration.html
+
+- OpenResty `ngx.balancer` API  
+  https://github.com/openresty/lua-resty-core/blob/master/lib/ngx/balancer.md
+
+- `lua-resty-healthcheck` — OpenResty 主动健康检查库  
+  https://kong.github.io/lua-resty-healthcheck/
+
+- `lua-resty-upstream` — 支持 priority-based pools 的 upstream 管理库  
+  https://opm.openresty.org/package/hamishforbes/lua-resty-upstream/
+
+- Kong Plugin Phases — 官方插件开发阶段说明  
+  https://developer.konghq.com/gateway/entities/plugin/
+
+- Kong issue #6241 — balancer 阶段未向自定义插件开放  
+  https://github.com/Kong/kong/issues/6241
+
+- Kong `kong.service.set_target()` PDK 文档  
+  https://developer.konghq.com/gateway/pdk/reference/kong.service/
+
+- Kong Upstream Targets — `failover` 标志说明（v3.12+）  
+  https://developer.konghq.com/gateway/entities/upstream/
 
 - Envoy Aggregate Cluster 官方文档  
   https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/aggregate_cluster
