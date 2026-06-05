@@ -12,8 +12,8 @@
 
 **原因**：
 - Envoy 的被动健康检查（outlierDetection）基于 5xx 比例，有时间窗口（通常需要数秒到数十秒的统计周期），无法做到亚秒级故障感知
-- Envoy 的主动健康检查在 Higress 开源版中配置受限，且探测周期不可精细控制
-- 我们需要基于 SMG 的 `/readiness` 语义做探测（PD 模式需要同时有 prefill 和 decode worker），而 Envoy 的 health check 只能做简单的 TCP/HTTP 探测，不理解 SMG 的业务语义
+- Envoy 的主动健康检查在 Higress 开源版中配置受限，探测周期和阈值的精细控制不如插件自主实现灵活
+- 插件自主探测可以直接调用 SMG 的 `/readiness` 端点（HTTP GET，返回 200/503），探测周期和失败阈值完全可控
 
 **目标拓扑结构**：
 
