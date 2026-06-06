@@ -495,7 +495,7 @@ V5.2 选择同步探测报告（原始数据），每个实例本地聚合，兼
 - **Fail-fast 聚合**处理探测分歧
 - **优雅降级**到独立模式
 
-V5.2 的详细设计文档（`active_standby_ha_design_v5.2_research.draft.md`）将上述原则落地为可执行的接口、算法和部署规格。
+V5.2 的详细设计文档（`active_standby_ha_design_v5.2_research.draft.md`）将上述原则落地为可执行的接口、算法和部署规格。其中引入了**共享的 `locked` endpoint 状态**（通过后端 CAS 写入，所有 Pod 订阅同步），实现了粘滞路由：当前 locked endpoint 健康时保持不动，不因高优先级节点恢复而回切；failover 采用顺序降级策略（从当前位置往后找下一个 HEALTHY），避免 cache tree 反复迁移。
 
 ---
 
