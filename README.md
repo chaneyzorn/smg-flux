@@ -208,7 +208,7 @@ V5.1 的拓扑结构大致如下：
 
 ## V5.2：L7 网关的分布式一致性动态路由决策
 
-V5.1 基于 `proxy-wasm SharedData` 在单个 Envoy 进程内同步 health check 状态。但 Higress Gateway 默认 `replicas=2`，每个 Pod 是独立进程，`SharedData` 不跨 Pod 共享也不跨生命周期持久。这导致两个失效场景：多实例时各 Pod 独立锁定不同 endpoint，cache tree 分散；进程重启后锁定状态丢失。
+V5.1 基于 `proxy-wasm SharedData` 在单个 Envoy 进程内同步 health check 状态。但 Higress Gateway 是多副本部署，每个 Pod 是独立进程，`SharedData` 不跨 Pod 共享也不跨生命周期持久。这导致两个失效场景：多实例时各 Pod 独立锁定不同 endpoint，cache tree 分散；进程重启后锁定状态丢失。
 
 V5.2 的解决思路是**确定性共识**：所有 Pod 通过发布订阅同步健康探测结果，每个 Pod 本地维护相同的健康视图，运行相同的确定性选择算法（按优先级选第一个 healthy endpoint），独立得出相同的路由决策。不需要分布式锁。
 
@@ -216,7 +216,7 @@ V5.2 的解决思路是**确定性共识**：所有 Pod 通过发布订阅同步
 
 - **Consul KV（默认）**：原生 HTTP blocking query，无需代理，与 proxy-wasm 异步模型完美适配。部署 3 节点 Consul server 集群。
 - **Nacos Config**：HTTP long polling，适合已有 Nacos 的环境。
-- **Redis Streams（备选）**：通过 Go bridge HTTP 代理访问。适合已有 Redis 但没有 Consul 的环境。
+- **Redis Streams（备选）**：Higress wasm-go 通过自定义 host 函数直接访问 Redis（RESP 协议），不需要 HTTP bridge。适合已有 Redis 的环境。
 - **etcd（不可行）**：K8s 自带 etcd 看似方便，但 proxy-wasm 不支持 gRPC/HTTP streaming，etcd Watch 无法工作；通过 K8s API Server 的 Watch 同样不可行。
 
 后端不可用时降级为 V5.1 行为。
@@ -323,7 +323,7 @@ V0 到 V8 的演进，本质上是在回答一个问题：SMG 的有状态后端
 从落地角度看，两个方向比较务实：
 
 - **轻松落地选 V4**：Operator + EndpointSlice。标准 K8s 范式，不侵入网关代码，运维团队熟悉。缺点是控制面和数据面之间有感知延迟。
-- **深入方向选 V5.2**：WASM 插件 + Pub/Sub 状态同步。请求路径零延迟，故障切换更快。默认后端是 Consul（3 节点集群，原生 HTTP，无需代理），已有 Redis 的环境也可使用 Redis + Go bridge 作为备选。WASM 代码需要持续维护。
+- **深入方向选 V5.2**：WASM 插件 + Pub/Sub 状态同步。请求路径零延迟，故障切换更快。默认后端是 Consul（3 节点集群，原生 HTTP），已有 Redis 的环境也可直接通过 Higress 自定义 host 访问 Redis 作为备选（无需 bridge）。WASM 代码需要持续维护。
 
 V6（cache tree 同步）是长期方向，如果走通则不再需要主备结构，但目前 sglang 源码中相关接口尚未完全打通。V7（镜像流量）已被证伪。V8（服务发现）因 McpBridge 限制而不适合 immediate 需求。
 
